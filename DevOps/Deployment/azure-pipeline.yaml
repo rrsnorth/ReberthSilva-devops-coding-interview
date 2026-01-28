@@ -1,0 +1,127 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - stage
+      - main
+
+pr:
+  branches:
+    include:
+      - develop
+      - stage
+      - main
+
+name: python-api-$(Date:yyyyMMdd)$(Rev:.r)
+
+variables:
+- ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+  - group: variableGroup-PRD
+- ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/develop') }}:
+  - group: variableGroup-DEV
+- ${{ if startsWith(variables['Build.SourceBranch'], 'refs/stage') }}:
+  - group: variableGroup-STG
+
+stages:
+- stage: BuildAndTest
+  displayName: Build and Test
+  jobs:
+  - job: build_test
+    displayName: Build + Unit Tests
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        set -euxo pipefail
+        python -m pip install --upgrade pip
+        if [ -f "requirements.txt" ]; then
+          pip install -r requirements.txt
+        fi
+        # If you use poetry instead, replace the above with poetry install
+      workingDirectory: '$(workingDirectory)'
+      displayName: 'Install dependencies'
+
+    - script: |
+        set -euxo pipefail
+        # Example with pytest; adapt to your existing test command.
+        # If your repo already has a specific command, use it.
+        pytest -q --disable-warnings --maxfail=1 --junitxml=$(Build.SourcesDirectory)/test-results/junit.xml
+      workingDirectory: '$(workingDirectory)'
+      displayName: 'Run tests'
+
+    - task: PublishTestResults@2
+      displayName: 'Publish test results'
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(Build.SourcesDirectory)/test-results/junit.xml'
+        failTaskOnFailedTests: true
+
+    # Create a deployable ZIP artifact.
+    # App Service (Linux) can run from ZIP deploy.
+    - script: |
+        set -euxo pipefail
+        mkdir -p $(Build.ArtifactStagingDirectory)
+        # Exclude venv/tests/cache/etc as needed
+        zip -r $(Build.ArtifactStagingDirectory)/app.zip . \
+          -x "*.git*" \
+          -x "*__pycache__*" \
+          -x "*.pytest_cache*" \
+          -x "test-results/*" \
+          -x ".venv/*" \
+          -x "venv/*"
+      workingDirectory: '$(workingDirectory)'
+      displayName: 'Package artifact (ZIP)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish artifact'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: '$(artifactName)'
+
+- stage: Deploy
+  displayName: Deploy to Azure (staging slot) and swap
+  dependsOn: BuildAndTest
+  condition: succeeded()   # only deploy if tests passed
+  jobs:
+  - deployment: deploy_staging
+    displayName: Deploy to staging slot
+    environment: 'python-api-prod'  # Create an Environment in ADO for approvals if you want
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: '$(artifactName)'
+
+          # Deploy ZIP to staging slot
+          - task: AzureWebApp@1
+            displayName: 'Deploy to App Service slot: $(slotName)'
+            inputs:
+              azureSubscription: "$(serviceAccont)"
+              appType: 'webAppLinux'
+              appName: '$(appName)'
+              deployToSlotOrASE: true
+              resourceGroupName: '$(resourceGroup)'
+              slotName: '$(slotName)'
+              package: '$(Pipeline.Workspace)/$(artifactName)/app.zip'
+
+          - task: AzureAppServiceManage@0
+            displayName: 'Swap slot $(slotName) -> production'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              WebAppName: '$(appName)'
+              ResourceGroupName: '$(resourceGroup)'
+              SourceSlot: '$(slotName)'
+              SwapWithProduction: true
